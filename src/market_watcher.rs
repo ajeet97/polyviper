@@ -1,39 +1,26 @@
-//! MarketWatcher — zero-gap market rotation with pre-armed WS subscriptions.
+//! MarketWatcher — self-contained, single-thread market monitoring.
 //!
-//! # Design
+//! Each watcher runs on its **own OS thread** with a dedicated `current_thread`
+//! tokio runtime. All async work — Gamma API fetch, WebSocket subscription,
+//! event processing, standby pre-arming — runs concurrently on that one thread.
 //!
-//! The key latency problem: when market N expires we must start consuming market
-//! N+1 *immediately*, with no round-trip to subscribe, no buffer miss, no gap.
-//!
-//! Solution: while market N is live we **pre-arm** the subscription for market
-//! N+1 (open the WS stream, populate its initial book) so that at the exact
-//! moment of expiry we just swap the pinned stream pointer — zero extra I/O.
+//! # Concurrency model
 //!
 //! ```text
-//!  timeline ──────────────────────────────────────────────────────────────────▶
-//!
-//!  market N   [==========================================]
-//!                     ↑ standby pre-arm starts here
-//!                     market N+1 [============================
-//!
-//!  expiry     ──────────────────────────────────────────▶ swap streams (≈0ms)
+//!  OS Thread (btc-5m)  ─── current_thread runtime
+//!    │
+//!    ├─ spawn_local: fetch standby metadata (HTTP, non-blocking)
+//!    │                                          ↓ result via JoinHandle
+//!    └─ 'events select! loop
+//!         ├─ Arm 1 (biased): active WS price-change events   ← hot path
+//!         ├─ Arm 2: expiry timer
+//!         └─ Arm 3: standby JoinHandle ready → subscribe WS
 //! ```
 //!
-//! ## Why `subscribe_prices` instead of `subscribe_orderbook`
-//!
-//! | | `subscribe_orderbook` (book events) | `subscribe_prices` (price_change events) |
-//! |---|---|---|
-//! | Fires when | Subscribe + every trade | Best bid/ask changes |
-//! | Carries | Full depth snapshot | `best_bid`/`best_ask` + changed price |
-//! | For best bid/ask | Must read `bids[0]`/`asks[0]` | Explicit fields |
-//!
-//! `price_change` fires specifically when the best bid or ask *changes* and
-//! explicitly carries the new best values — ideal for top-of-book tracking.
-//!
-//! To switch to full orderbook depth later:
-//! 1. Change `PriceStream` to `BookStream` (see `BookStream` type alias below)
-//! 2. Change `subscribe_market` to call `ws.subscribe_prices` → `ws.subscribe_orderbook`
-//! 3. Change `apply_event` to call `apply_book_update` instead of `apply_price_change`
+//! The HTTP fetch runs as a `spawn_local` task. Its `JoinHandle` is stored and
+//! polled as Arm 3 in `select!`. When Arm 1 fires (WS event), the handle is
+//! NOT dropped — the task keeps running. On the next iteration Arm 3 picks up
+//! the result as soon as the task completes.
 
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -44,33 +31,26 @@ use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, PriceChange};
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::types::{Decimal, U256};
 use tokio::time::sleep_until;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument as _};
 
-use crate::market_finder::{Market, MarketBuffer};
+use crate::market_config::{Market, MarketConfig};
+use crate::polymarket_api::fetch_market_with_retry;
 
-// ─── Stream type ─────────────────────────────────────────────────────────────
-//
-// Using `price_change` events: lightweight, fires on best bid/ask changes,
-// and explicitly carries updated best_bid / best_ask per token.
-//
-// `BookStream` is kept as a type alias so the switcher comment above is concrete.
+// ─── Stream types ─────────────────────────────────────────────────────────────
+
 #[allow(dead_code)]
 type BookStream = Pin<Box<dyn Stream<Item = polymarket_client_sdk::Result<BookUpdate>> + Send>>;
 type PriceStream = Pin<Box<dyn Stream<Item = polymarket_client_sdk::Result<PriceChange>> + Send>>;
 
-// ─── Price level ──────────────────────────────────────────────────────────────
+// ─── TokenBook ────────────────────────────────────────────────────────────────
 
-/// Best bid & ask for one binary-market token leg.
 #[derive(Debug, Clone, Default)]
 pub struct TokenBook {
-    /// Highest buy order price. `None` until the first WS event arrives.
     pub best_bid: Option<Decimal>,
-    /// Lowest sell order price. `None` until the first WS event arrives.
     pub best_ask: Option<Decimal>,
 }
 
 impl TokenBook {
-    /// Mid-price = (bid + ask) / 2, or `None` if either side is missing.
     #[inline]
     pub fn mid(&self) -> Option<Decimal> {
         match (self.best_bid, self.best_ask) {
@@ -79,7 +59,6 @@ impl TokenBook {
         }
     }
 
-    /// Spread = ask − bid, or `None` if either side is missing.
     #[inline]
     pub fn spread(&self) -> Option<Decimal> {
         match (self.best_bid, self.best_ask) {
@@ -89,19 +68,15 @@ impl TokenBook {
     }
 }
 
-// ─── Combined live view ───────────────────────────────────────────────────────
+// ─── MarketBook ───────────────────────────────────────────────────────────────
 
-/// Live best-bid/ask snapshot for both legs of a 5-minute binary market.
 #[derive(Debug, Clone, Default)]
 pub struct MarketBook {
-    /// UP token (pays out if price ends above threshold).
     pub up: TokenBook,
-    /// DOWN token (pays out if price ends at or below threshold).
     pub down: TokenBook,
 }
 
 impl MarketBook {
-    /// `true` once at least one price event has arrived for *each* leg.
     #[inline]
     pub fn is_ready(&self) -> bool {
         self.up.best_bid.is_some() && self.down.best_bid.is_some()
@@ -110,79 +85,110 @@ impl MarketBook {
 
 // ─── Strategy ─────────────────────────────────────────────────────────────────
 
-/// Implement this to plug in any trading or monitoring strategy.
 pub trait Strategy: Send + 'static {
-    /// Called exactly once each time the active market rotates.
-    ///
-    /// `previous` is `None` on the very first market.
     fn on_market_change(&mut self, previous: Option<&Market>, current: &Market) {
         let _ = (previous, current);
     }
-
-    /// Called on every CLOB price-change event for the **active** market.
-    ///
-    /// Hot path — keep it fast. `book` always reflects the latest best bid/ask.
-    /// Use [`MarketBook::is_ready`] to skip until both legs have initialised.
     fn on_book_update(&mut self, market: &Market, book: &MarketBook);
 }
 
 // ─── MarketWatcher ────────────────────────────────────────────────────────────
 
 pub struct MarketWatcher<S: Strategy> {
-    buf: MarketBuffer,
+    client: reqwest::Client,
+    config: MarketConfig,
     ws: WsClient,
     strategy: S,
 }
 
 impl<S: Strategy> MarketWatcher<S> {
-    /// Create a new watcher backed by `buf`.
-    ///
-    /// Start the `MarketFinder` background task (`.spawn()`) before calling
-    /// `run()`, otherwise the watcher spins until the buffer has data.
-    pub fn new(buf: MarketBuffer, strategy: S) -> Self {
+    fn new(client: reqwest::Client, config: MarketConfig, strategy: S) -> Self {
         Self {
-            buf,
+            client,
+            config,
             ws: WsClient::default(),
             strategy,
         }
     }
 
-    /// Start the event loop — runs forever.
+    /// Spawn this watcher on a dedicated OS thread with its own tokio runtime.
+    /// `WsClient` is created inside the thread — no `Send` requirement.
+    pub fn spawn_thread(
+        client: reqwest::Client,
+        config: MarketConfig,
+        strategy: S,
+        span: tracing::Span,
+    ) -> std::thread::JoinHandle<()>
+    where
+        S: Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build watcher runtime");
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                let mut watcher = MarketWatcher::new(client, config, strategy);
+                watcher.run().instrument(span).await;
+            }));
+        })
+    }
+
     pub async fn run(&mut self) {
         info!("watcher starting");
 
-        // ── Phase 0: wait for first market ───────────────────────────────────
+        // ── Phase 0: fetch first market ───────────────────────────────────────
         let t_boot = Instant::now();
-        loop {
-            if self.buf.current().is_some() {
-                break;
+        let first_slug = self.config.slug_for_end_ts(
+            self.config
+                .round_down(polymarket_client_sdk::types::Utc::now().timestamp()),
+        );
+        info!(slug = %first_slug, "booting — fetching first market");
+
+        let first_market = loop {
+            match fetch_market_with_retry(&self.client, &first_slug).await {
+                Some(m) => break m,
+                None => {
+                    warn!("could not fetch first market, retrying in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
-            debug!("buffer empty, waiting...");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        };
         info!(
             boot_ms = format_args!("{:.1}", t_boot.elapsed().as_secs_f64() * 1000.0),
-            "first market available"
+            market = %first_market.slug,
+            "first market fetched"
         );
 
-        let mut active_market: Option<Market> = None;
-        let mut active_stream: Option<PriceStream> = None;
+        // ── Phase 1: cold-subscribe first market ──────────────────────────────
+        warn!(market = %first_market.slug, "no standby ready — cold subscribe (~1 RTT)");
+        let t_sub = Instant::now();
+        let first_stream = self.subscribe_market(&first_market).await;
+        info!(
+            subscribe_ms = format_args!("{:.1}", t_sub.elapsed().as_secs_f64() * 1000.0),
+            "cold subscribe latency"
+        );
+
+        let mut active_market: Option<Market> = Some(first_market);
+        let mut active_stream: Option<PriceStream> = first_stream;
         let mut active_book = MarketBook::default();
 
-        // Standby = pre-armed subscription for market N+1.
-        // Populated synchronously (WS subscription is fast once the connection
-        // is up — it's just a protocol message, no new TCP handshake).
         let mut standby_market: Option<Market> = None;
         let mut standby_stream: Option<PriceStream> = None;
         let mut standby_book = MarketBook::default();
+        // JoinHandle for the concurrent standby metadata fetch (spawn_local task)
+        let mut standby_fetch: Option<tokio::task::JoinHandle<Option<Market>>> = None;
 
-        // Tracks when the last rotation completed so we can measure
-        // time-to-first-event: the real latency saved by standby pre-arming.
-        let mut t_rotation_end: Option<Instant> = None;
+        self.strategy
+            .on_market_change(None, active_market.as_ref().unwrap());
+
+        let mut t_rotation_end: Option<Instant> = Some(Instant::now());
         let mut rotation_was_promotion = false;
 
+        // ── Main loop ─────────────────────────────────────────────────────────
         loop {
-            // ── Step 1: rotate to next market if active has expired ───────────
+            // ── Rotation ─────────────────────────────────────────────────────
             let should_rotate = active_market
                 .as_ref()
                 .map(|m| m.is_expired())
@@ -190,59 +196,59 @@ impl<S: Strategy> MarketWatcher<S> {
 
             if should_rotate {
                 let t_rotate = Instant::now();
+                let prev = active_market.take();
 
-                let prev_market = active_market.take(); // grab before overwrite
-
-                // Spin until buffer has a non-expired market
-                let next = loop {
-                    match self.buf.current() {
-                        Some(m) => break m,
-                        None => {
-                            warn!("buffer empty on rotation — waiting 50ms");
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                };
-
-                // Unsubscribe previous legs (best-effort)
-                if let Some(ref prev) = prev_market {
-                    self.unsubscribe_market(prev);
+                if let Some(ref p) = prev {
+                    self.unsubscribe_market(p);
                 }
 
-                // Promote standby if it matches the next market (zero-latency)
+                // Abort any in-flight standby fetch — it fetched for the wrong slot
+                if let Some(h) = standby_fetch.take() {
+                    h.abort();
+                }
+
+                // Promote standby if available and non-expired
                 let can_promote = standby_market
                     .as_ref()
-                    .map(|sm| sm.slug == next.slug)
+                    .map(|sm| !sm.is_expired())
                     .unwrap_or(false);
 
                 if can_promote {
-                    info!(market = %next.slug, "🔀 promoting standby → active");
-                    active_market = standby_market.take();
+                    let sm = standby_market.take().unwrap();
+                    info!(market = %sm.slug, "🔀 promoting standby → active");
                     active_stream = standby_stream.take();
-                    // Standby book is already warmed — carry it over as-is
                     active_book = std::mem::take(&mut standby_book);
+                    active_market = Some(sm);
                     rotation_was_promotion = true;
                 } else {
-                    // Cold subscribe — first market only, or if standby wasn't ready
-                    warn!(market = %next.slug, "no standby ready — cold subscribe (~1 RTT)");
-                    let t_sub = Instant::now();
+                    // No standby ready — fetch & cold-subscribe
+                    let slug = prev
+                        .as_ref()
+                        .map(|p| self.config.slug_for_end_ts(p.end_time))
+                        .unwrap_or_else(|| {
+                            let ts = polymarket_client_sdk::types::Utc::now().timestamp();
+                            self.config.slug_for_end_ts(self.config.round_down(ts))
+                        });
+                    warn!(market = %slug, "no standby ready — cold subscribe (~1 RTT)");
+                    let next = loop {
+                        match fetch_market_with_retry(&self.client, &slug).await {
+                            Some(m) => break m,
+                            None => tokio::time::sleep(Duration::from_millis(200)).await,
+                        }
+                    };
+                    let t_s = Instant::now();
                     active_stream = self.subscribe_market(&next).await;
                     info!(
-                        subscribe_ms =
-                            format_args!("{:.1}", t_sub.elapsed().as_secs_f64() * 1000.0),
+                        subscribe_ms = format_args!("{:.1}", t_s.elapsed().as_secs_f64() * 1000.0),
                         "cold subscribe latency"
                     );
-                    active_market = Some(next);
                     active_book = MarketBook::default();
+                    self.strategy.on_market_change(prev.as_ref(), &next);
+                    active_market = Some(next);
                     rotation_was_promotion = false;
                 }
 
-                // Notify strategy
-                if let Some(ref m) = active_market {
-                    self.strategy.on_market_change(prev_market.as_ref(), m);
-                }
-
-                // Reset standby — will be re-armed inside the event loop below
+                // Reset standby state
                 standby_market = None;
                 standby_stream = None;
                 standby_book = MarketBook::default();
@@ -251,11 +257,10 @@ impl<S: Strategy> MarketWatcher<S> {
                     rotation_ms = format_args!("{:.1}", t_rotate.elapsed().as_secs_f64() * 1000.0),
                     "rotation complete"
                 );
-                // Start the clock — we'll log how long until the first event arrives.
                 t_rotation_end = Some(Instant::now());
             }
 
-            // ── Step 2: event loop until expiry or stream error ───────────────
+            // ── Event loop ───────────────────────────────────────────────────
             let stream = match active_stream.as_mut() {
                 Some(s) => s,
                 None => {
@@ -274,51 +279,42 @@ impl<S: Strategy> MarketWatcher<S> {
             };
 
             'events: loop {
-                // ── Pre-arm standby if not yet done ───────────────────────────
-                // Checked on every iteration so we retry until the buffer has
-                // the next market available (it may not be there immediately
-                // after rotation). peek_next() is O(1) — just a Mutex + deque
-                // index — so this is essentially free on the hot path.
-                if standby_stream.is_none() {
-                    if let Some(next_market) = self.buf.peek_next() {
-                        info!(market = %next_market.slug, "🏹 pre-arming standby");
-                        let t_prearm = Instant::now();
-                        standby_stream = self.subscribe_market(&next_market).await;
-                        info!(
-                            subscribe_ms =
-                                format_args!("{:.1}", t_prearm.elapsed().as_secs_f64() * 1000.0),
-                            "standby subscribe latency"
-                        );
-                        standby_market = Some(next_market);
+                // ── Arm standby fetch if not started ─────────────────────────
+                // Spawn a local task to fetch next-market metadata concurrently.
+                // The JoinHandle is stored and polled as Arm 3 in select! below.
+                // If Arm 1 fires (WS event), the handle is NOT dropped — the
+                // HTTP fetch task keeps running on the same runtime.
+                if standby_fetch.is_none() && standby_market.is_none() {
+                    if let Some(ref m) = active_market {
+                        let next_slug = self.config.slug_for_end_ts(m.end_time);
+                        let client2 = self.client.clone();
+                        info!(slug = %next_slug, "🔍 standby fetch started");
+                        standby_fetch = Some(tokio::task::spawn_local(async move {
+                            fetch_market_with_retry(&client2, &next_slug).await
+                        }));
                     }
-                    // else: buffer doesn't have next market yet — will retry next iteration
                 }
 
-                // Non-blockingly drain standby stream to warm its book.
-                // Uses the standby market's token IDs for correct leg assignment.
-                if let (Some(ref mut sb_stream), Some(ref sb_market)) =
-                    (&mut standby_stream, &standby_market)
+                // ── Drain standby stream to warm its book ────────────────────
+                if let (Some(ref mut sb_s), Some(ref sb_m)) = (&mut standby_stream, &standby_market)
                 {
-                    while let Ok(Some(result)) = tokio::time::timeout(
-                        Duration::from_micros(1), // non-blocking peek
-                        sb_stream.next(),
-                    )
-                    .await
+                    while let Ok(Some(Ok(ev))) =
+                        tokio::time::timeout(Duration::from_micros(1), sb_s.next()).await
                     {
-                        if let Ok(event) = result {
-                            apply_price_change(
-                                &event,
-                                &mut standby_book,
-                                &sb_market.up_token,
-                                &sb_market.down_token,
-                            );
-                        }
+                        apply_price_change(
+                            &ev,
+                            &mut standby_book,
+                            &sb_m.up_token,
+                            &sb_m.down_token,
+                        );
                     }
                 }
 
+                // ── Three-arm select! ─────────────────────────────────────────
                 tokio::select! {
-                    biased; // market events take priority over the expiry timer
+                    biased;
 
+                    // Arm 1: active WS events — highest priority
                     maybe = stream.next() => match maybe {
                         None => {
                             warn!("active stream closed — re-subscribing");
@@ -332,39 +328,69 @@ impl<S: Strategy> MarketWatcher<S> {
                         }
                         Some(Ok(event)) => {
                             let t_event = Instant::now();
-                            // Log time-to-first-event once per rotation — this
-                            // is the real measure of what standby pre-arming saves.
                             if let Some(t_rot) = t_rotation_end.take() {
-                                let first_event_ms = t_rot.elapsed().as_secs_f64() * 1000.0;
                                 info!(
-                                    first_event_ms = format_args!("{:.1}", first_event_ms),
+                                    first_event_ms = format_args!("{:.1}", t_rot.elapsed().as_secs_f64() * 1000.0),
                                     via = if rotation_was_promotion { "standby" } else { "cold" },
                                     "⏱ first event after rotation"
                                 );
                             }
                             if let Some(ref m) = active_market {
-                                apply_price_change(
-                                    &event,
-                                    &mut active_book,
-                                    &m.up_token,
-                                    &m.down_token,
-                                );
+                                apply_price_change(&event, &mut active_book, &m.up_token, &m.down_token);
                                 let t_strat = Instant::now();
                                 self.strategy.on_book_update(m, &active_book);
-                                debug!(strategy_ms = format_args!("{:.3}", t_strat.elapsed().as_secs_f64() * 1000.0), "strategy.on_book_update");
+                                debug!(
+                                    strategy_ms = format_args!("{:.3}", t_strat.elapsed().as_secs_f64() * 1000.0),
+                                    total_ms = format_args!("{:.3}", t_event.elapsed().as_secs_f64() * 1000.0),
+                                    "event → strategy"
+                                );
                             }
-                            debug!(total_ms = format_args!("{:.3}", t_event.elapsed().as_secs_f64() * 1000.0), "event → strategy total");
                         }
                     },
 
+                    // Arm 2: expiry timer
                     _ = sleep_until(deadline) => {
                         info!(
                             market = active_market.as_ref().map(|m| m.slug.as_str()).unwrap_or("?"),
                             "⏰ market expired"
                         );
-                        // Outer loop will detect is_expired() and rotate
                         break 'events;
-                    }
+                    },
+
+                    // Arm 3: standby metadata fetch complete → subscribe WS
+                    //
+                    // Uses an async block instead of a guarded arm to avoid
+                    // a tokio::select! gotcha: even when `if guard` is false,
+                    // the arm *expression* is still evaluated before the guard
+                    // is checked, which would call `.unwrap()` on None.
+                    //
+                    // The async block is safe: it returns `pending()` when
+                    // there is no in-flight fetch, effectively disabling Arm 3.
+                    // When Arm 1 fires and drops this block, the JoinHandle in
+                    // `standby_fetch` is NOT dropped — the task keeps running.
+                    // The next iteration creates a fresh block that polls the
+                    // same handle and resolves immediately once the task is done.
+                    result = async {
+                        match standby_fetch.as_mut() {
+                            Some(h) => h.await.ok().unwrap_or(None),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        standby_fetch = None;
+                        match result {
+                            Some(market) => {
+                                info!(market = %market.slug, "🏹 standby metadata ready, subscribing WS");
+                                let t = Instant::now();
+                                standby_stream = self.subscribe_market(&market).await;
+                                info!(
+                                    subscribe_ms = format_args!("{:.1}", t.elapsed().as_secs_f64() * 1000.0),
+                                    "standby WS subscribed"
+                                );
+                                standby_market = Some(market);
+                            }
+                            None => warn!("standby metadata fetch returned None — will retry"),
+                        }
+                    },
                 }
             }
         }
@@ -372,7 +398,6 @@ impl<S: Strategy> MarketWatcher<S> {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Subscribe to price-change events for both legs of a market.
     async fn subscribe_market(&self, market: &Market) -> Option<PriceStream> {
         let (up, down) = match (
             parse_token_id(&market.up_token),
@@ -380,15 +405,15 @@ impl<S: Strategy> MarketWatcher<S> {
         ) {
             (Some(u), Some(d)) => (u, d),
             _ => {
-                warn!(market = %market.slug, "failed to parse token IDs");
+                warn!(slug = %market.slug, "failed to parse token IDs");
                 return None;
             }
         };
 
         info!(
             market = %market.slug,
-            up = &market.up_token[..8.min(market.up_token.len())],
-            down = &market.down_token[..8.min(market.down_token.len())],
+            up = %market.up_token,
+            down = %market.down_token,
             "subscribing to price-change stream"
         );
 
@@ -401,35 +426,23 @@ impl<S: Strategy> MarketWatcher<S> {
         }
     }
 
-    /// Unsubscribe from price-change events for a market's legs (best-effort).
     fn unsubscribe_market(&self, market: &Market) {
-        let (u, d) = match (
+        if let (Some(up), Some(down)) = (
             parse_token_id(&market.up_token),
             parse_token_id(&market.down_token),
         ) {
-            (Some(u), Some(d)) => (u, d),
-            _ => return,
-        };
-        if let Err(e) = self.ws.unsubscribe_prices(&[u, d]) {
-            warn!(error = %e, "unsubscribe_prices failed (non-fatal)");
+            let _ = self.ws.unsubscribe_prices(&[up, down]);
         }
     }
 }
 
-// ─── Apply a price_change event to a MarketBook ───────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Update `book` from a CLOB `price_change` event.
-///
-/// # Leg identification
-/// Uses string comparison of decimal token IDs (`entry.asset_id.to_string()`)
-/// against the market's stored `up_token` / `down_token` strings, avoiding any
-/// `U256::from_str` ↔ serde deserialization representation mismatches.
-///
-/// # Update priority
-/// 1. `best_bid` / `best_ask` on the entry — provided by the server when
-///    `custom_feature_enabled` is set; most accurate (post-change snapshot).
-/// 2. `price` + `side` fallback — `price_change` fires when the best bid/ask
-///    changes; `price` is the new best value for that `side`.
+fn parse_token_id(decimal_str: &str) -> Option<U256> {
+    use std::str::FromStr;
+    U256::from_str(decimal_str).ok()
+}
+
 fn apply_price_change(
     event: &PriceChange,
     book: &mut MarketBook,
@@ -437,54 +450,18 @@ fn apply_price_change(
     down_token: &str,
 ) {
     for entry in &event.price_changes {
-        // String comparison avoids U256 representation issues
-        let asset_str = entry.asset_id.to_string();
-
-        let leg = if asset_str == up_token {
+        let id_str = entry.asset_id.to_string();
+        let leg = if id_str == up_token {
             &mut book.up
-        } else if asset_str == down_token {
+        } else if id_str == down_token {
             &mut book.down
         } else {
-            debug!(
-                asset = &asset_str[..8.min(asset_str.len())],
-                "price_change for unknown asset — skipping"
-            );
             continue;
         };
-
-        // Priority 1: explicit best_bid / best_ask from the server
-        let mut updated = false;
-        if let Some(bb) = entry.best_bid {
-            leg.best_bid = Some(bb);
-            updated = true;
-        }
-        if let Some(ba) = entry.best_ask {
-            leg.best_ask = Some(ba);
-            updated = true;
-        }
-
-        // Priority 2: infer from price + side
-        // price_change fires when best bid/ask changes; `price` IS the new best
-        if !updated {
-            match entry.side {
-                Side::Buy => leg.best_bid = Some(entry.price),
-                Side::Sell => leg.best_ask = Some(entry.price),
-                _ => {} // unknown side variant — ignore
-            }
-        }
-    }
-}
-
-// ─── Helper ───────────────────────────────────────────────────────────────────
-
-/// Parse a decimal token ID string to `U256` (needed for WS subscribe/unsubscribe).
-/// Data matching uses string comparison — this is only for API call arguments.
-fn parse_token_id(id: &str) -> Option<U256> {
-    match id.parse::<U256>() {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warn!(id, error = %e, "cannot parse token id");
-            None
+        match entry.side {
+            Side::Buy => leg.best_bid = Some(entry.price),
+            Side::Sell => leg.best_ask = Some(entry.price),
+            _ => {}
         }
     }
 }

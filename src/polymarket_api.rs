@@ -1,7 +1,11 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use polymarket_client_sdk::types::DateTime;
+use tokio::time::sleep;
+use tracing::{debug, warn};
 
-use crate::market_finder::Market;
+use crate::market_config::Market;
 
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 const CLOB_API: &str = "https://clob.polymarket.com";
@@ -80,4 +84,20 @@ pub async fn fetch_market_by_slug(
     }
 
     Ok(None)
+}
+
+/// Fetch a market by slug with exponential back-off retries.
+/// Returns `None` after 20 failed attempts.
+pub async fn fetch_market_with_retry(client: &reqwest::Client, slug: &str) -> Option<Market> {
+    let mut delay_ms = 100u64;
+    for attempt in 1..=20 {
+        match fetch_market_by_slug(client, slug).await {
+            Ok(Some(m)) => return Some(m),
+            Ok(None) => debug!(%slug, attempt, "market not indexed yet"),
+            Err(e) => warn!(%slug, attempt, error = %e, "fetch error"),
+        }
+        sleep(Duration::from_millis(delay_ms)).await;
+        delay_ms = (delay_ms * 15 / 10).min(2_000);
+    }
+    None
 }

@@ -1,14 +1,14 @@
 use polymarket_client_sdk::types::Decimal;
-use tracing::{info, Instrument as _};
+use tracing::info;
 
-use crate::market_finder::{AssetID, Market, MarketFinder};
+use crate::market_config::{Market, MarketConfig};
 use crate::market_watcher::{MarketBook, MarketWatcher, Strategy};
 
-mod market_finder;
+mod market_config;
 mod market_watcher;
 mod polymarket_api;
 
-// ── Demo strategy ─────────────────────────────────────────────────────────────
+// ── Strategy ──────────────────────────────────────────────────────────────────
 
 struct LogStrategy;
 
@@ -24,35 +24,19 @@ impl Strategy for LogStrategy {
         if !book.is_ready() {
             return;
         }
-
         let (Some(up_ask), Some(down_ask)) = (book.up.best_ask, book.down.best_ask) else {
             return;
         };
-
-        // In a binary market UP + DOWN always settle to 1.0 combined.
-        // Buying both legs costs (up_ask + down_ask).
-        // If that total < 1.0 you lock in (1.0 - total) risk-free profit.
         let cost = up_ask + down_ask;
         let edge = Decimal::ONE - cost;
-
         if edge > Decimal::ZERO {
             info!(
                 market = %market.slug,
                 up_ask = %up_ask,
                 down_ask = %down_ask,
-                cost = %cost,
                 edge = %edge,
                 "⚡ SIMULATE EXECUTE"
             );
-        } else {
-            // info!(
-            //     market = %market.slug,
-            //     up_ask = %up_ask,
-            //     down_ask = %down_ask,
-            //     cost = %cost,
-            //     edge = %edge,
-            //     "no edge"
-            // );
         }
     }
 }
@@ -61,25 +45,34 @@ impl Strategy for LogStrategy {
 
 #[tokio::main]
 async fn main() {
-    // Initialise tracing. Set RUST_LOG to control verbosity:
-    //   RUST_LOG=info cargo run      → info + above
-    //   RUST_LOG=debug cargo run     → includes latency fields
-    //   RUST_LOG=polyviper=debug     → scoped to this crate
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "polyviper=info".parse().unwrap()),
         )
-        .with_target(false) // cleaner output without module paths
+        .with_target(false)
         .init();
 
     let client = reqwest::Client::new();
-    let (finder, buf) = MarketFinder::new(client, AssetID::BTC);
-    finder.spawn();
 
-    let mut watcher = MarketWatcher::new(buf, LogStrategy);
-    watcher
-        .run()
-        .instrument(tracing::info_span!("watcher"))
-        .await;
+    // ── Add / remove configs to watch more markets in parallel ────────────────
+    let configs = vec![MarketConfig::btc_5m()];
+
+    // Each config gets its own OS thread + tokio runtime. Fully self-contained.
+    let handles: Vec<_> = configs
+        .into_iter()
+        .map(|config| {
+            let label = config.label();
+            MarketWatcher::spawn_thread(
+                client.clone(),
+                config,
+                LogStrategy,
+                tracing::info_span!("watcher", market = label),
+            )
+        })
+        .collect();
+
+    for h in handles {
+        h.join().ok();
+    }
 }
