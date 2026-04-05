@@ -35,18 +35,20 @@ main
 ## Market lifecycle
 
 ```
-t=0s   boot: fetch btc-updown-5m-N, cold WS subscribe
-t=0.4s first event arrives
-t=0.5s standby fetch started (btc-updown-5m-N+300)
-t=0.7s standby metadata ready, WS subscribed (standby armed ✓)
+t=0ms   boot: fetch btc-updown-5m-N               (86ms)
+t=86ms  cold WS subscribe                         (0.6ms)
+t=...   first event arrives                       (varies by tick rate)
+t=...   standby fetch started (btc-updown-5m-N+300)
+t=...   standby metadata ready, WS subscribed     (standby armed ✓)
 
         ... 5 minutes of live events on market N ...
 
-t=300s ⏰ market N expired
-       🔀 promote standby → active            (swap, ~0ms)
-       ⏱  first event via standby: ~10ms
-       🔍 start new standby fetch for N+600
+t=300s  ⏰ market N expired
+        🔀 promote standby → active               (0.1ms)
+        ⏱  first event via standby: 1.4ms
+        🔍 start new standby fetch for N+600
 ```
+
 
 ## Running
 
@@ -108,4 +110,19 @@ src/
 ├── market_config.rs    # MarketConfig + Market types, slug arithmetic
 └── polymarket_api.rs   # Gamma API client (fetch market by slug)
 ```
+## Performance
 
+Measured from GCP **us-east4** (Northern Virginia) on BTC-5m markets. 
+
+| Metric | us-east4 |
+|--------|----------|
+| Boot fetch (Gamma API) | ~86ms |
+| Cold WS subscribe | ~0.6ms |
+| Standby metadata fetch | ~20ms |
+| Standby WS subscribe | ~0ms |
+| Rotation time | ~0.1ms |
+| **First event after rotation (standby)** | **~1-2ms** |
+
+*Note: The ~86ms boot fetch latency appears uniformly across regions (tested US and EU), suggesting this is Polymarket's backend DB/processing latency rather than network RTT. Additionally, the time to first event via a "cold" boot depends purely on how fast the next market trade occurs, while the standby path guarantees continuous coverage.*
+
+The standby pre-arming strategy entirely eliminates the ~100ms+ API fetch and connection penalty during market rotations.
