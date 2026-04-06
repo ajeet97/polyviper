@@ -26,8 +26,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt as _};
-use polymarket_client_sdk::clob::types::Side;
-use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, PriceChange};
+use polymarket_client_sdk::clob::ws::types::response::BookUpdate;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::types::{Decimal, U256};
 use tokio::time::sleep_until;
@@ -38,35 +37,37 @@ use crate::polymarket_api::fetch_market_with_retry;
 
 // ─── Stream types ─────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 type BookStream = Pin<Box<dyn Stream<Item = polymarket_client_sdk::Result<BookUpdate>> + Send>>;
-type PriceStream = Pin<Box<dyn Stream<Item = polymarket_client_sdk::Result<PriceChange>> + Send>>;
+// type PriceStream = Pin<Box<dyn Stream<Item = polymarket_client_sdk::Result<PriceChange>> + Send>>;
 
 // ─── TokenBook ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenBook {
     pub best_bid: Option<Decimal>,
+    pub best_bid_size: Option<Decimal>,
+
     pub best_ask: Option<Decimal>,
+    pub best_ask_size: Option<Decimal>,
 }
 
-impl TokenBook {
-    #[inline]
-    pub fn mid(&self) -> Option<Decimal> {
-        match (self.best_bid, self.best_ask) {
-            (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
-            _ => None,
-        }
-    }
+// impl TokenBook {
+//     #[inline]
+//     pub fn mid(&self) -> Option<Decimal> {
+//         match (self.best_bid, self.best_ask) {
+//             (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
+//             _ => None,
+//         }
+//     }
 
-    #[inline]
-    pub fn spread(&self) -> Option<Decimal> {
-        match (self.best_bid, self.best_ask) {
-            (Some(b), Some(a)) if a > b => Some(a - b),
-            _ => None,
-        }
-    }
-}
+//     #[inline]
+//     pub fn spread(&self) -> Option<Decimal> {
+//         match (self.best_bid, self.best_ask) {
+//             (Some(b), Some(a)) if a > b => Some(a - b),
+//             _ => None,
+//         }
+//     }
+// }
 
 // ─── MarketBook ───────────────────────────────────────────────────────────────
 
@@ -171,11 +172,11 @@ impl<S: Strategy> MarketWatcher<S> {
         );
 
         let mut active_market: Option<Market> = Some(first_market);
-        let mut active_stream: Option<PriceStream> = first_stream;
+        let mut active_stream: Option<BookStream> = first_stream;
         let mut active_book = MarketBook::default();
 
         let mut standby_market: Option<Market> = None;
-        let mut standby_stream: Option<PriceStream> = None;
+        let mut standby_stream: Option<BookStream> = None;
         let mut standby_book = MarketBook::default();
         // JoinHandle for the concurrent standby metadata fetch (spawn_local task)
         let mut standby_fetch: Option<tokio::task::JoinHandle<Option<Market>>> = None;
@@ -295,20 +296,20 @@ impl<S: Strategy> MarketWatcher<S> {
                     }
                 }
 
-                // ── Drain standby stream to warm its book ────────────────────
-                if let (Some(ref mut sb_s), Some(ref sb_m)) = (&mut standby_stream, &standby_market)
-                {
-                    while let Ok(Some(Ok(ev))) =
-                        tokio::time::timeout(Duration::from_micros(1), sb_s.next()).await
-                    {
-                        apply_price_change(
-                            &ev,
-                            &mut standby_book,
-                            &sb_m.up_token,
-                            &sb_m.down_token,
-                        );
-                    }
-                }
+                // // ── Drain standby stream to warm its book ────────────────────
+                // if let (Some(ref mut sb_s), Some(ref sb_m)) = (&mut standby_stream, &standby_market)
+                // {
+                //     while let Ok(Some(Ok(ev))) =
+                //         tokio::time::timeout(Duration::from_micros(1), sb_s.next()).await
+                //     {
+                //         apply_book_update(
+                //             &last_update,
+                //             &mut standby_book,
+                //             &sb_m.up_token,
+                //             &sb_m.down_token,
+                //         );
+                //     }
+                // }
 
                 // ── Three-arm select! ─────────────────────────────────────────
                 tokio::select! {
@@ -336,14 +337,24 @@ impl<S: Strategy> MarketWatcher<S> {
                                 );
                             }
                             if let Some(ref m) = active_market {
-                                apply_price_change(&event, &mut active_book, &m.up_token, &m.down_token);
-                                let t_strat = Instant::now();
-                                self.strategy.on_book_update(m, &active_book);
-                                debug!(
-                                    strategy_ms = format_args!("{:.3}", t_strat.elapsed().as_secs_f64() * 1000.0),
-                                    total_ms = format_args!("{:.3}", t_event.elapsed().as_secs_f64() * 1000.0),
-                                    "event → strategy"
-                                );
+                                apply_book_update(&event, &mut active_book, &m.up_token, &m.down_token);
+
+                                let mut drain_count = 0;
+                                while let Ok(Some(Ok(ev))) = tokio::time::timeout(Duration::from_micros(1), stream.next()).await {
+                                    apply_book_update(&ev, &mut active_book, &m.up_token, &m.down_token);
+                                    drain_count += 1;
+                                }
+
+                                if active_book.is_ready() {
+                                    let t_strat = Instant::now();
+                                    self.strategy.on_book_update(m, &active_book);
+                                    debug!(
+                                        drain_count,
+                                        strategy_ms = format_args!("{:.3}", t_strat.elapsed().as_secs_f64() * 1000.0),
+                                        total_ms = format_args!("{:.3}", t_event.elapsed().as_secs_f64() * 1000.0),
+                                        "event → strategy"
+                                    );
+                                }
                             }
                         }
                     },
@@ -398,7 +409,7 @@ impl<S: Strategy> MarketWatcher<S> {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    async fn subscribe_market(&self, market: &Market) -> Option<PriceStream> {
+    async fn subscribe_market(&self, market: &Market) -> Option<BookStream> {
         let (up, down) = match (
             parse_token_id(&market.up_token),
             parse_token_id(&market.down_token),
@@ -417,10 +428,10 @@ impl<S: Strategy> MarketWatcher<S> {
             "subscribing to price-change stream"
         );
 
-        match self.ws.subscribe_prices(vec![up, down]) {
-            Ok(s) => Some(Box::pin(s) as PriceStream),
+        match self.ws.subscribe_orderbook(vec![up, down]) {
+            Ok(s) => Some(Box::pin(s) as BookStream),
             Err(e) => {
-                warn!(error = %e, "subscribe_prices failed");
+                warn!(error = %e, "subscribe_orderbook failed");
                 None
             }
         }
@@ -443,25 +454,21 @@ fn parse_token_id(decimal_str: &str) -> Option<U256> {
     U256::from_str(decimal_str).ok()
 }
 
-fn apply_price_change(
-    event: &PriceChange,
-    book: &mut MarketBook,
-    up_token: &str,
-    down_token: &str,
-) {
-    for entry in &event.price_changes {
-        let id_str = entry.asset_id.to_string();
-        let leg = if id_str == up_token {
-            &mut book.up
-        } else if id_str == down_token {
-            &mut book.down
-        } else {
-            continue;
-        };
-        match entry.side {
-            Side::Buy => leg.best_bid = Some(entry.price),
-            Side::Sell => leg.best_ask = Some(entry.price),
-            _ => {}
-        }
+fn apply_book_update(event: &BookUpdate, book: &mut MarketBook, up_token: &str, down_token: &str) {
+    let id_str = event.asset_id.to_string();
+    let leg = if id_str == up_token {
+        &mut book.up
+    } else if id_str == down_token {
+        &mut book.down
+    } else {
+        return;
+    };
+
+    if let (Some(best_bid), Some(best_ask)) = (event.bids.first(), event.asks.last()) {
+        leg.best_bid = Some(best_bid.price);
+        leg.best_bid_size = Some(best_bid.size);
+
+        leg.best_ask = Some(best_ask.price);
+        leg.best_ask_size = Some(best_ask.size);
     }
 }

@@ -1,47 +1,11 @@
-use polymarket_client_sdk::types::Decimal;
-use tracing::info;
-
-use crate::market_config::{Market, MarketConfig};
-use crate::market_watcher::{MarketBook, MarketWatcher, Strategy};
+use crate::market_config::MarketConfig;
+use crate::market_watcher::MarketWatcher;
+use crate::strategies::edge_strategy::EdgeStrategy;
 
 mod market_config;
 mod market_watcher;
 mod polymarket_api;
-
-// ── Strategy ──────────────────────────────────────────────────────────────────
-
-struct LogStrategy;
-
-impl Strategy for LogStrategy {
-    fn on_market_change(&mut self, previous: Option<&Market>, current: &Market) {
-        match previous {
-            Some(prev) => info!(from = %prev.slug, to = %current.slug, "🔄 market rotated"),
-            None => info!(market = %current.slug, "🚀 first market"),
-        }
-    }
-
-    fn on_book_update(&mut self, market: &Market, book: &MarketBook) {
-        if !book.is_ready() {
-            return;
-        }
-        let (Some(up_ask), Some(down_ask)) = (book.up.best_ask, book.down.best_ask) else {
-            return;
-        };
-        let cost = up_ask + down_ask;
-        let edge = Decimal::ONE - cost;
-        if edge > Decimal::ZERO {
-            info!(
-                market = %market.slug,
-                up_ask = %up_ask,
-                down_ask = %down_ask,
-                edge = %edge,
-                "⚡ SIMULATE EXECUTE"
-            );
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
+mod strategies;
 
 #[tokio::main]
 async fn main() {
@@ -66,7 +30,7 @@ async fn main() {
             MarketWatcher::spawn_thread(
                 client.clone(),
                 config,
-                LogStrategy,
+                EdgeStrategy::new("0.001", true),
                 tracing::info_span!("watcher", market = label),
             )
         })
