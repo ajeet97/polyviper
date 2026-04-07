@@ -32,35 +32,40 @@ impl Strategy for LatencyArbStrategy {
         risk: Arc<Mutex<RiskManager>>,
         intent_tx: mpsc::Sender<OrderIntent>,
     ) {
-        info!("Starting Latency Arbitrage Strategy (divergence threshold: {:.2}%)", self.divergence_threshold * 100.0);
-        
+        info!(
+            "Starting Latency Arbitrage Strategy (divergence threshold: {:.2}%)",
+            self.divergence_threshold * 100.0
+        );
+
         loop {
             // Wake up ideally the millisecond Binance pushes a new price
             if let Ok(()) = bus.binance_eth.changed().await {
                 let eth_bbo = *bus.binance_eth.borrow();
                 let pm_books = bus.polymarket_books.borrow().clone();
-                
-                // Pure proxy metric for "true" probability. 
-                // Actual production system would map the CEX price directly 
+
+                // Pure proxy metric for "true" probability.
+                // Actual production system would map the CEX price directly
                 // to a Black-Scholes binary option probability formula.
                 // We mock it for the skeleton logic.
                 let true_prob = 0.50; // Mock derived from Binance price standard dev
-                
-                // Compare true_prob to the implied probability on Polymarket 
+
+                // Compare true_prob to the implied probability on Polymarket
                 // (e.g. up_token best ask and bid)
-                
+
                 for (token_id, book) in pm_books {
                     let implied_prob = book.best_ask; // What PM thinks the probability is
-                    if implied_prob == 0.0 { continue; }
-                    
+                    if implied_prob == 0.0 {
+                        continue;
+                    }
+
                     let edge = (true_prob - implied_prob).abs();
 
                     if edge > self.divergence_threshold {
                         info!(
-                            token_id = %token_id, 
-                            edge = edge, 
-                            pm_implied = implied_prob, 
-                            true_p = true_prob, 
+                            token_id = %token_id,
+                            edge = edge,
+                            pm_implied = implied_prob,
+                            true_p = true_prob,
                             "LATENCY ARBITRAGE OPPORTUNITY DETECTED"
                         );
 

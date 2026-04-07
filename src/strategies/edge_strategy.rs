@@ -16,9 +16,7 @@ pub struct EdgeStrategy {
 
 impl EdgeStrategy {
     pub fn new(min_edge: f64) -> Self {
-        Self {
-            min_edge,
-        }
+        Self { min_edge }
     }
 }
 
@@ -30,7 +28,7 @@ impl Strategy for EdgeStrategy {
         _intent_tx: mpsc::Sender<OrderIntent>,
     ) {
         info!("Starting Pure Edge Strategy (min_edge: {})", self.min_edge);
-        
+
         loop {
             if let Ok(()) = bus.polymarket_books.changed().await {
                 let books = bus.polymarket_books.borrow().clone();
@@ -41,10 +39,13 @@ impl Strategy for EdgeStrategy {
                     if let (Some(a1), Some(a2)) = (asks.next(), asks.next()) {
                         let cost = a1 + a2;
                         let edge = 1.0 - cost;
-                        
+
                         // If taking both sides yields positive edge
                         if cost > 0.0 && edge >= self.min_edge {
-                            info!("Pure Arbitrage Found! Edge: {:.4} (Cost: {:.4})", edge, cost);
+                            info!(
+                                "Pure Arbitrage Found! Edge: {:.4} (Cost: {:.4})",
+                                edge, cost
+                            );
                             // Normally we would blast 2 limit taker OrderIntents here.
                         }
                     }

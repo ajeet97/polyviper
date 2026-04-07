@@ -61,13 +61,15 @@ impl PolymarketFeeder {
         let mut standby_stream = None;
 
         // Publish the initial empty state
-        let _ = self.tx.send(Some((active_market.clone(), active_books.clone())));
+        let _ = self
+            .tx
+            .send(Some((active_market.clone(), active_books.clone())));
 
         loop {
             // Check Rotation
             if active_market.is_expired() {
                 self.unsubscribe_market(&active_market);
-                
+
                 if let Some(h) = standby_fetch.take() {
                     h.abort();
                 }
@@ -87,7 +89,9 @@ impl PolymarketFeeder {
                 }
 
                 active_books.clear();
-                let _ = self.tx.send(Some((active_market.clone(), active_books.clone())));
+                let _ = self
+                    .tx
+                    .send(Some((active_market.clone(), active_books.clone())));
             }
 
             let stream = match active_stream.as_mut() {
@@ -174,7 +178,11 @@ impl PolymarketFeeder {
     async fn subscribe_market(
         &self,
         market: &Market,
-    ) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = polymarket_client_sdk::Result<BookUpdate>> + Send>>> {
+    ) -> Option<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = polymarket_client_sdk::Result<BookUpdate>> + Send>,
+        >,
+    > {
         let up = U256::from_str(&market.up_token).ok()?;
         let down = U256::from_str(&market.down_token).ok()?;
 

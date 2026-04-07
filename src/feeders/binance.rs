@@ -22,7 +22,10 @@ impl BinanceFeeder {
     }
 
     pub async fn run(&self) {
-        let ws_url = format!("wss://stream.binance.com:9443/ws/{}@bookTicker", self.symbol);
+        let ws_url = format!(
+            "wss://stream.binance.com:9443/ws/{}@bookTicker",
+            self.symbol
+        );
         let url = Url::parse(&ws_url).expect("Invalid Binance WS URL");
 
         info!("BinanceFeeder starting for {}", self.symbol);
@@ -36,8 +39,12 @@ impl BinanceFeeder {
                     while let Some(msg) = read.next().await {
                         if let Ok(Message::Text(text)) = msg {
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let (Some(b_str), Some(a_str)) = (json["b"].as_str(), json["a"].as_str()) {
-                                    if let (Ok(bid), Ok(ask)) = (b_str.parse::<f64>(), a_str.parse::<f64>()) {
+                                if let (Some(b_str), Some(a_str)) =
+                                    (json["b"].as_str(), json["a"].as_str())
+                                {
+                                    if let (Ok(bid), Ok(ask)) =
+                                        (b_str.parse::<f64>(), a_str.parse::<f64>())
+                                    {
                                         let bbo = BBO { bid, ask };
                                         let _ = self.tx.send(bbo); // Non-blocking
                                     }

@@ -26,7 +26,16 @@ pub struct OrderIntent {
 
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
-    BookUpdate { market_id: String, token_id: String, book: PolymarketBook },
-    CexPriceUpdate { symbol: String, bbo: BBO },
-    DvolUpdate { value: f64 },
+    BookUpdate {
+        market_id: String,
+        token_id: String,
+        book: PolymarketBook,
+    },
+    CexPriceUpdate {
+        symbol: String,
+        bbo: BBO,
+    },
+    DvolUpdate {
+        value: f64,
+    },
 }

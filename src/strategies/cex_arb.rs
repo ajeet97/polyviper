@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::core::bus::WatchBus;
 use crate::core::models::OrderIntent;
@@ -32,25 +32,21 @@ impl Strategy for CexArbStrategy {
         intent_tx: mpsc::Sender<OrderIntent>,
     ) {
         info!("Starting CexArb Strategy for {}", self.symbol);
-        
+
         loop {
             // Wait for binance tick
             if let Ok(()) = bus.binance_eth.changed().await {
                 let eth_bbo = *bus.binance_eth.borrow();
                 let pm_books = bus.polymarket_books.borrow().clone();
-                
+
                 // Example macro filter
                 let dvol = *bus.dvol.borrow();
-                
+
                 // --- INSERT FAIR VALUE MATH HERE ---
                 let fair_value = (eth_bbo.bid + eth_bbo.ask) / 2.0;
 
                 // Simple debug output
-                debug!(
-                    fair_value = fair_value,
-                    dvol = dvol,
-                    "Tick Evaluated"
-                );
+                debug!(fair_value = fair_value, dvol = dvol, "Tick Evaluated");
 
                 // --- INSERT ORDER BATCHING HERE ---
                 // If fair value diverges from our resting orders, we

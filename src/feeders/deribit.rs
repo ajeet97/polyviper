@@ -32,7 +32,11 @@ impl DeribitFeeder {
                         }
                     });
 
-                    if ws_stream.send(Message::Text(subscribe_msg.to_string())).await.is_err() {
+                    if ws_stream
+                        .send(Message::Text(subscribe_msg.to_string()))
+                        .await
+                        .is_err()
+                    {
                         error!("Failed to subscribe to Deribit DVOL");
                         sleep(Duration::from_secs(5)).await;
                         continue;
@@ -43,7 +47,8 @@ impl DeribitFeeder {
                         if let Ok(Message::Text(text)) = msg {
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                                 if json["method"] == "subscription" {
-                                    if let Some(val) = json["params"]["data"]["volatility"].as_f64() {
+                                    if let Some(val) = json["params"]["data"]["volatility"].as_f64()
+                                    {
                                         let _ = self.tx.send(val);
                                     }
                                 }

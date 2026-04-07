@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{warn, error};
+use tracing::{error, warn};
 
 pub struct RiskManager {
     pub initial_portfolio_value: f64,
     pub current_portfolio_value: f64,
     pub start_of_day_value: f64,
     pub last_day_reset: u64,
-    
+
     killswitch_threshold: f64, // For oracle depeg
     consecutive_errors: u32,
     latest_binance: f64,
@@ -15,7 +15,10 @@ pub struct RiskManager {
 
 impl RiskManager {
     pub fn new(initial_portfolio: f64, killswitch_threshold: f64) -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         Self {
             initial_portfolio_value: initial_portfolio,
             current_portfolio_value: initial_portfolio,
@@ -30,7 +33,11 @@ impl RiskManager {
 
     pub fn update_portfolio(&mut self, current_value: f64) {
         self.current_portfolio_value = current_value;
-        let today = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86400;
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 86400;
         if today > self.last_day_reset {
             self.start_of_day_value = current_value;
             self.last_day_reset = today;
@@ -52,12 +59,12 @@ impl RiskManager {
 
     /// Calculates a size based on expected value (edge) but hard caps at 8% of portfolio.
     pub fn calculate_kelly_size(&self, edge: f64) -> f64 {
-        // Simplified Kelly: fractional kelly based on pure edge. 
+        // Simplified Kelly: fractional kelly based on pure edge.
         // Real Kelly = W - ((1 - W) / R). For simple binary arb assuming W=edge.
         // Let's use a proxy metric: fraction of portfolio to risk equal to edge itself, up to 8% max.
         let raw_size = self.current_portfolio_value * edge;
         let max_size = self.current_portfolio_value * 0.08; // 8% Max Size Rule
-        
+
         raw_size.min(max_size).max(1.0) // Minimum $1 order
     }
 
@@ -65,21 +72,25 @@ impl RiskManager {
         if self.consecutive_errors > 5 {
             return Err("Killswitch activated: excessive consecutive errors.");
         }
-        
+
         if self.is_oracle_depegged() {
             return Err("Killswitch activated: Oracle De-Peg detected between Binance/Coinbase.");
         }
 
         // Daily Drawdown Limit (-20%)
-        let daily_pnl = (self.current_portfolio_value - self.start_of_day_value) / self.start_of_day_value;
+        let daily_pnl =
+            (self.current_portfolio_value - self.start_of_day_value) / self.start_of_day_value;
         if daily_pnl <= -0.20 {
             return Err("Daily Stop-Loss Hit: -20% drawdown. Trading halted.");
         }
 
         // Total Drawdown Kill Switch (-40%)
-        let total_pnl = (self.current_portfolio_value - self.initial_portfolio_value) / self.initial_portfolio_value;
+        let total_pnl = (self.current_portfolio_value - self.initial_portfolio_value)
+            / self.initial_portfolio_value;
         if total_pnl <= -0.40 {
-            return Err("TOTAL DESTRUCTION KILL SWITCH HIT: -40% from initial investment. Shutting down.");
+            return Err(
+                "TOTAL DESTRUCTION KILL SWITCH HIT: -40% from initial investment. Shutting down.",
+            );
         }
 
         let max_allowed_size = self.current_portfolio_value * 0.08;
@@ -127,11 +138,18 @@ impl VelocityLockout {
     }
 
     pub fn is_locked(&self) -> bool {
-        if let (Some(&(_, first_p)), Some(&(_, last_p))) = (self.last_prices.front(), self.last_prices.back()) {
-            if first_p == 0.0 { return false; }
+        if let (Some(&(_, first_p)), Some(&(_, last_p))) =
+            (self.last_prices.front(), self.last_prices.back())
+        {
+            if first_p == 0.0 {
+                return false;
+            }
             let velocity = ((last_p - first_p) / first_p).abs();
             if velocity > self.threshold_percent {
-                warn!("Velocity Lockout active: price moved {:.2}%", velocity * 100.0);
+                warn!(
+                    "Velocity Lockout active: price moved {:.2}%",
+                    velocity * 100.0
+                );
                 return true;
             }
         }

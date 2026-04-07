@@ -35,7 +35,8 @@ impl Bootstrapper {
         let price = Decimal::from_str("0.01")?;
         let size = Decimal::from_str("10.0")?; // Total $0.10, the exact minimum that won't execute normally
 
-        let u256_token = polymarket_client_sdk::types::U256::from_str(market_id).unwrap_or_default();
+        let u256_token =
+            polymarket_client_sdk::types::U256::from_str(market_id).unwrap_or_default();
 
         let order = oms
             .client()
