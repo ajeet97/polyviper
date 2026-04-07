@@ -1,58 +1,54 @@
-use polymarket_client_sdk::types::Decimal;
-use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use crate::market_config::Market;
-use crate::market_watcher::{MarketBook, Strategy};
+use crate::core::bus::WatchBus;
+use crate::core::models::OrderIntent;
+use crate::oms::risk::RiskManager;
+use crate::strategies::Strategy;
 
+/// Pure Arbitrage Strategy:
+/// Looks for instances where the best ask of UP + best ask of DOWN < 1.0.
+/// This guarantees a risk-free profit minus fees.
 pub struct EdgeStrategy {
-    min_edge: Decimal,
-    simulate: bool,
+    min_edge: f64,
 }
 
 impl EdgeStrategy {
-    pub fn new(min_edge_str: &str, simulate: bool) -> Self {
+    pub fn new(min_edge: f64) -> Self {
         Self {
-            min_edge: Decimal::from_str(min_edge_str).expect("invalid decimal string for min_edge"),
-            simulate: simulate,
+            min_edge,
         }
     }
 }
 
 impl Strategy for EdgeStrategy {
-    fn on_market_change(&mut self, previous: Option<&Market>, current: &Market) {
-        match previous {
-            Some(prev) => info!(from = %prev.slug, to = %current.slug, "🔄 market rotated"),
-            None => info!(market = %current.slug, "🚀 first market"),
-        }
-    }
+    async fn run(
+        &mut self,
+        mut bus: WatchBus,
+        _risk: Arc<Mutex<RiskManager>>,
+        _intent_tx: mpsc::Sender<OrderIntent>,
+    ) {
+        info!("Starting Pure Edge Strategy (min_edge: {})", self.min_edge);
+        
+        loop {
+            if let Ok(()) = bus.polymarket_books.changed().await {
+                let books = bus.polymarket_books.borrow().clone();
 
-    fn on_book_update(&mut self, market: &Market, book: &MarketBook) {
-        let (Some(up_ask), Some(down_ask)) = (book.up.best_ask, book.down.best_ask) else {
-            return;
-        };
-
-        let cost = up_ask + down_ask;
-        let edge = Decimal::ONE - cost;
-
-        let up_vol_usd = up_ask * book.up.best_ask_size.unwrap_or(Decimal::ZERO);
-        let down_vol_usd = down_ask * book.down.best_ask_size.unwrap_or(Decimal::ZERO);
-        let volume_usd = up_vol_usd + down_vol_usd;
-
-        if edge >= self.min_edge {
-            if self.simulate {
-                info!(
-                    market = %market.slug,
-                    up_ask = %up_ask,
-                    down_ask = %down_ask,
-                    edge = %edge,
-                    up_vol_usd = %up_vol_usd,
-                    down_vol_usd = %down_vol_usd,
-                    volume_usd = %volume_usd,
-                    "🤑 SIMULATE EXECUTE"
-                );
-            } else {
-                // Actual execution here
+                // If we don't have exactly 2 keys (UP and DOWN), we skip safely.
+                if books.len() == 2 {
+                    let mut asks = books.values().map(|b| b.best_ask);
+                    if let (Some(a1), Some(a2)) = (asks.next(), asks.next()) {
+                        let cost = a1 + a2;
+                        let edge = 1.0 - cost;
+                        
+                        // If taking both sides yields positive edge
+                        if cost > 0.0 && edge >= self.min_edge {
+                            info!("Pure Arbitrage Found! Edge: {:.4} (Cost: {:.4})", edge, cost);
+                            // Normally we would blast 2 limit taker OrderIntents here.
+                        }
+                    }
+                }
             }
         }
     }
